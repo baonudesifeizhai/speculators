@@ -118,6 +118,19 @@ def test_resolve_key_prefers_exact_over_alias():
     assert _resolve_key("embed_tokens.weight", wm) == "embed_tokens.weight"
 
 
+@pytest.mark.smoke
+def test_resolve_key_prefers_qwen3_omni_thinker_prefix():
+    wm = {
+        "talker.model.norm.weight": "talker.safetensors",
+        "thinker.model.norm.weight": "thinker.safetensors",
+    }
+
+    assert (
+        _resolve_key("model.norm.weight", wm, preferred_prefix="thinker.")
+        == "thinker.model.norm.weight"
+    )
+
+
 # _resolve_file Tests
 
 

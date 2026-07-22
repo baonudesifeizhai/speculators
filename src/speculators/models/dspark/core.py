@@ -1,13 +1,21 @@
 from typing import ClassVar
 
 import torch
+from torch import nn
 from transformers import PretrainedConfig
 
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.metrics import compute_metrics
-from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
+from speculators.models.dspark.model_definitions import (
+    MODALITY_NAMES,
+    ConfidenceHead,
+    MarkovHead,
+    ModalityLogitHead,
+    ModalityRouter,
+    infer_anchor_modalities,
+)
 from speculators.models.metrics import LossConfig, kl_div_loss, resolve_loss_config
 from speculators.models.utils import conditional_torch_compile
 
@@ -55,6 +63,27 @@ class DSparkDraftModel(DFlashDraftModel):
             )
             self.confidence_head = ConfidenceHead(input_dim)
 
+        self.modality_heads = nn.ModuleDict()
+        self.modality_router: ModalityRouter | None = None
+        if config.modality_head_rank > 0:
+            missing = set(MODALITY_NAMES[1:]) - set(config.modality_token_ids)
+            if missing:
+                raise ValueError(
+                    "modality_token_ids is missing routes for: "
+                    + ", ".join(sorted(missing))
+                )
+            self.modality_heads = nn.ModuleDict(
+                {
+                    name: ModalityLogitHead(
+                        hidden_size,
+                        self.draft_vocab_size,
+                        config.modality_head_rank,
+                    )
+                    for name in MODALITY_NAMES
+                }
+            )
+            self.modality_router = ModalityRouter(hidden_size, len(MODALITY_NAMES))
+
     @classmethod
     def from_training_args(
         cls,
@@ -66,6 +95,13 @@ class DSparkDraftModel(DFlashDraftModel):
         """Create a DSpark model from training arguments (mirrors DFlash)."""
         enable_confidence_head_arg = kwargs.get("enable_confidence_head")
         confidence_head_with_markov_arg = kwargs.get("confidence_head_with_markov")
+        modality_head_rank = kwargs.get("modality_head_rank", 0)
+        modality_token_ids = kwargs.get("modality_token_ids") or {}
+        if modality_head_rank > 0 and not modality_token_ids:
+            modality_token_ids = cls._resolve_modality_token_ids(
+                kwargs["verifier_name_or_path"]
+            )
+
         config = DSparkSpeculatorConfig(
             **cls._build_base_config_kwargs("dspark", verifier_config, **kwargs),
             markov_rank=kwargs.get("markov_rank", 256),
@@ -80,6 +116,8 @@ class DSparkDraftModel(DFlashDraftModel):
                 if confidence_head_with_markov_arg is None
                 else confidence_head_with_markov_arg
             ),
+            modality_head_rank=modality_head_rank,
+            modality_token_ids=modality_token_ids,
         )
 
         model = cls(config=config)
@@ -88,12 +126,54 @@ class DSparkDraftModel(DFlashDraftModel):
         return model
 
     @staticmethod
+    def _resolve_modality_token_ids(verifier_name_or_path: str) -> dict[str, list[int]]:
+        """Resolve Qwen-style modality pad IDs from the verifier tokenizer."""
+        from speculators.data_generation.preprocessing import (  # noqa: PLC0415
+            get_tokenizer,
+            load_processor,
+        )
+
+        processor = load_processor(verifier_name_or_path)
+        tokenizer = get_tokenizer(processor)
+        token_names = {
+            "image": "<|image_pad|>",
+            "audio": "<|audio_pad|>",
+            "video": "<|video_pad|>",
+        }
+        vocab = tokenizer.get_vocab()
+        missing = [token for token in token_names.values() if token not in vocab]
+        if missing:
+            raise ValueError(
+                "Could not enable modality heads because the verifier tokenizer "
+                f"does not define: {', '.join(missing)}"
+            )
+        return {name: [int(vocab[token])] for name, token in token_names.items()}
+
+    @torch.compiler.disable
+    def _apply_modality_heads(
+        self,
+        hidden_blocks: torch.Tensor,
+        logits_blocks: torch.Tensor,
+        block_modality_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply exactly one low-rank residual head to each anchor block."""
+        residual = torch.zeros_like(logits_blocks)
+        for modality_id, name in enumerate(MODALITY_NAMES):
+            selected = block_modality_ids == modality_id
+            if torch.any(selected):
+                residual[selected] = self.modality_heads[name](
+                    hidden_blocks[selected]
+                ).to(residual.dtype)
+        return logits_blocks + residual
+
+    @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
         """Resolve DSpark's compound loss from ``--loss-fn``."""
         loss_config = resolve_loss_config(kwargs["loss_fn"])
         gamma = kwargs.get("dflash_decay_gamma", 4.0)
         max_anchors = kwargs.get("max_anchors", 3072)
         confidence_head_alpha = kwargs.get("confidence_head_alpha", 1.0)
+        modality_router_alpha = kwargs.get("modality_router_alpha", 0.1)
         per_position_loss_weight = kwargs.get(
             "per_position_loss_weight", "fixed-exp-decay"
         )
@@ -103,6 +183,7 @@ class DSparkDraftModel(DFlashDraftModel):
             "gamma": gamma,
             "max_anchors": max_anchors,
             "confidence_head_alpha": confidence_head_alpha,
+            "modality_router_alpha": modality_router_alpha,
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
         }
@@ -121,6 +202,7 @@ class DSparkDraftModel(DFlashDraftModel):
         gamma: float = 4.0,
         max_anchors: int = 3072,
         confidence_head_alpha: float = 1.0,
+        modality_router_alpha: float = 0.1,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
         **kwargs,
@@ -157,6 +239,29 @@ class DSparkDraftModel(DFlashDraftModel):
                 [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
             )  # [num_blocks, block]
         hidden_blocks = hidden.view(num_blocks, block, -1)
+
+        aligned_modality_ids = None
+        modality_router_logits = None
+        if self.modality_heads:
+            anchor_positions = anchored_block_indices.view(num_blocks, block)[:, 0]
+            block_modality_ids = infer_anchor_modalities(
+                input_ids,
+                document_ids,
+                anchor_positions,
+                self.config.modality_token_ids,
+            )
+            if self.modality_router is None:
+                raise RuntimeError("modality heads require a modality router")
+            modality_router_logits = self.modality_router(hidden_blocks)
+            logits_blocks = logits.view(num_blocks, block, -1)
+            logits = self._apply_modality_heads(
+                hidden_blocks,
+                logits_blocks,
+                block_modality_ids,
+            ).view(1, mask_tokens_size, -1)
+            aligned_modality_ids = block_modality_ids.repeat_interleave(block).view(
+                1, mask_tokens_size
+            )
 
         confidence_logits = None
         prev_emb = None
@@ -196,5 +301,9 @@ class DSparkDraftModel(DFlashDraftModel):
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
+            modality_ids=aligned_modality_ids,
+            modality_names=MODALITY_NAMES if aligned_modality_ids is not None else None,
+            modality_router_logits=modality_router_logits,
+            modality_router_alpha=modality_router_alpha,
         )
         return None, loss, metrics

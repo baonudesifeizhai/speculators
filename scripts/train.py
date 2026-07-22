@@ -26,6 +26,7 @@ from speculators.models.mtp.data import shift_batch_mtp
 from speculators.models.utils import (
     get_verifier_config,
     resolve_draft_intermediate_size,
+    resolve_verifier_text_config,
 )
 from speculators.train.dataloader import create_train_val_loaders
 from speculators.train.distributed import (
@@ -131,11 +132,9 @@ def create_transformer_layer_config(  # noqa: C901
         )
 
     config_class = DRAFT_ARCH_CONFIGS[draft_arch]
-    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
-
-    # For multimodal models (Qwen3VL, etc.), extract text_config
-    if hasattr(verifier_config, "text_config"):
-        verifier_config = verifier_config.text_config
+    verifier_config = resolve_verifier_text_config(
+        AutoConfig.from_pretrained(verifier_name_or_path)
+    )
 
     hidden_act = (
         hidden_act
@@ -363,9 +362,9 @@ def parse_vocab_mappings(args: argparse.Namespace):
         "None. Using full verifier vocab"
     )
     # When vocab mapping is not provided, use the full verifier vocab
-    verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path)
-    if hasattr(verifier_config, "text_config"):
-        verifier_config = verifier_config.text_config
+    verifier_config = resolve_verifier_text_config(
+        AutoConfig.from_pretrained(args.verifier_name_or_path)
+    )
     return None, None, verifier_config.vocab_size
 
 
@@ -644,6 +643,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
+        validation_data_path=args.validation_data_path,
     )
 
     # Get trainer kwargs from model class
@@ -827,6 +827,16 @@ def parse_args():
         help=(
             "The path where cached hidden states files are stored. (Default: "
             "args.data_path / 'hidden_states')"
+        ),
+    )
+    parser.add_argument(
+        "--validation-data-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional Arrow dataset used exclusively for validation. When set, "
+            "all rows in --data-path are used for training and all rows in this "
+            "dataset are used for validation instead of splitting --data-path."
         ),
     )
     parser.add_argument(
@@ -1145,6 +1155,24 @@ def parse_args():
         type=float,
         default=1.0,
         help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
+    )
+    parser.add_argument(
+        "--modality-head-rank",
+        type=int,
+        default=0,
+        help=(
+            "DSpark: rank of separate text/image/audio/video residual logit heads. "
+            "0 disables modality-specific heads (default: 0)."
+        ),
+    )
+    parser.add_argument(
+        "--modality-router-alpha",
+        type=float,
+        default=0.1,
+        help=(
+            "DSpark: weight of the supervised modality-router loss when "
+            "modality heads are enabled (default: 0.1)."
+        ),
     )
     parser.add_argument(
         "--draft-attn-impl",

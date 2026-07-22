@@ -505,7 +505,17 @@ def _passthrough_pretokenized(
     need no chat-template rendering or regex span detection.
     """
     results: dict[str, list] = {"input_ids": [], "loss_mask": [], "seq_len": []}
-    for ids, mask in zip(examples["input_ids"], examples["loss_mask"], strict=True):
+    messages = examples.get("messages")
+    if messages is not None:
+        if len(messages) != len(examples["input_ids"]):
+            raise ValueError(
+                "Pre-tokenized messages and input_ids must have the same length"
+            )
+        results["messages"] = []
+
+    for row_idx, (ids, mask) in enumerate(
+        zip(examples["input_ids"], examples["loss_mask"], strict=True)
+    ):
         # `strict=True` only pairs the columns; a per-row skew would survive it and
         # the collator packs each key independently, silently shifting the mask
         # against the ids for every sample packed after this one.
@@ -524,6 +534,8 @@ def _passthrough_pretokenized(
         results["input_ids"].append(torch.tensor(trimmed_ids, dtype=torch.long))
         results["loss_mask"].append(torch.tensor(trimmed_mask, dtype=torch.long))
         results["seq_len"].append(len(trimmed_ids))
+        if messages is not None:
+            results["messages"].append(messages[row_idx])
     return results
 
 

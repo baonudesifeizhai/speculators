@@ -94,6 +94,8 @@ def with_retries(fn):
 def extract_output(
     response: Completion | ChatCompletion,
     token_ids: list[int],
+    *,
+    allow_token_id_mismatch: bool = False,
 ) -> str:
     if isinstance(response, Completion):
         prompt_token_ids = getattr(response.choices[0], "prompt_token_ids", None)
@@ -103,9 +105,16 @@ def extract_output(
     if prompt_token_ids is None:
         raise InvalidResponseError("Response missing prompt_token_ids")
 
-    if prompt_token_ids != token_ids:
+    if prompt_token_ids != token_ids and not allow_token_id_mismatch:
         raise InvalidResponseError(
             f"Prompt token IDs mismatch: expected {token_ids}, got {prompt_token_ids}"
+        )
+    if prompt_token_ids != token_ids:
+        logger.info(
+            "The server expanded a multimodal prompt from %d to %d tokens; "
+            "the training loader will align the loss mask to the returned token IDs.",
+            len(token_ids),
+            len(prompt_token_ids),
         )
 
     kv_transfer_params = getattr(response, "kv_transfer_params", None)
@@ -123,11 +132,18 @@ class ClientItem(TypedDict):
     """If provided, pass `messages` to Chat Completions API
     instead of passing `token_ids` to Completions API."""
 
+    loss_mask: NotRequired[list[int]]
+    """Training mask for ``input_ids``; never sent to the OpenAI API."""
+
 
 async def _poll_lock_async(fd, poll_interval):
     while True:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Readers only need to wait for the writer's exclusive lock to be
+            # released.  Use a shared lock because ``fd`` is opened read-only;
+            # NFS rejects an exclusive lock on a read-only descriptor with
+            # EBADF (``[Errno 9] Bad file descriptor``).
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             return
         except BlockingIOError:
             await asyncio.sleep(poll_interval)
@@ -150,7 +166,10 @@ def wait_for_lock(lock_path, timeout=10.0, poll_interval=0.1):
         deadline = time.monotonic() + timeout
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Match the async reader above: a shared lock blocks behind the
+                # server's exclusive writer lock and is valid for O_RDONLY on
+                # local filesystems and NFS.
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
@@ -202,7 +221,10 @@ async def generate_hidden_states_async(
             max_tokens=1,
             extra_body={
                 "add_generation_prompt": False,
-                "continue_final_message": True,
+                # Replay a completed teacher response, including its final
+                # turn marker. Continuing the final message strips that marker
+                # and drops a supervised token from hidden-state extraction.
+                "continue_final_message": False,
                 "return_token_ids": True,
             },
             timeout=timeout,
@@ -214,7 +236,11 @@ async def generate_hidden_states_async(
     else:
         res = await coro
 
-    return extract_output(res, token_ids)
+    return extract_output(
+        res,
+        token_ids,
+        allow_token_id_mismatch=messages is not None,
+    )
 
 
 @with_retries
@@ -248,10 +274,15 @@ def generate_hidden_states(
             max_tokens=1,
             extra_body={
                 "add_generation_prompt": False,
-                "continue_final_message": True,
+                # Keep the completed assistant turn marker; see the async path.
+                "continue_final_message": False,
                 "return_token_ids": True,
             },
             timeout=timeout,
         )
 
-    return extract_output(res, token_ids)
+    return extract_output(
+        res,
+        token_ids,
+        allow_token_id_mismatch=messages is not None,
+    )

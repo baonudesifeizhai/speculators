@@ -3,13 +3,17 @@
 import json
 from pathlib import Path
 
+import pytest
 import torch
 from datasets import Dataset
+from safetensors.torch import save_file
 
 from speculators.models.eagle3.data import shift_batch
 from speculators.train.data import (
     ArrowDataset,
     SampleFileDataset,
+    align_multimodal_loss_mask,
+    build_client_item,
     create_collate_fn,
     standardize_data_v1,
 )
@@ -492,3 +496,108 @@ def test_arrow_dataset_on_generate_cache_creates_hidden_states_dir(tmp_path: Pat
     )
 
     assert arrow_ds.hidden_states_path.is_dir()
+
+
+def test_align_multimodal_loss_mask_allows_user_placeholder_expansion():
+    source_ids = [1, 90, 90, 2, 3, 4, 5]
+    source_mask = [0, 0, 0, 0, 1, 1, 0]
+    target_ids = [1, 90, 90, 90, 90, 2, 3, 4]
+
+    aligned = align_multimodal_loss_mask(source_ids, source_mask, target_ids)
+
+    assert aligned.tolist() == [0, 0, 0, 0, 0, 0, 1, 1]
+
+
+def test_align_multimodal_loss_mask_rejects_assistant_token_change():
+    with pytest.raises(ValueError, match="assistant training tokens"):
+        align_multimodal_loss_mask(
+            [1, 2, 3],
+            [0, 1, 0],
+            [1, 99, 3],
+        )
+
+
+def test_build_client_item_decodes_serialized_multimodal_messages():
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": "file:///tmp/question.wav"},
+                }
+            ],
+        },
+        {"role": "assistant", "content": "answer"},
+    ]
+    item = {
+        "input_ids": torch.tensor([1, 2]),
+        "loss_mask": torch.tensor([0, 1]),
+        "messages": json.dumps(messages),
+    }
+
+    assert build_client_item(item)["messages"] == messages
+
+
+def test_build_client_item_treats_null_messages_as_text_only():
+    item = {
+        "input_ids": torch.tensor([10, 20, 30]),
+        "loss_mask": torch.tensor([0, 1, 1]),
+        "messages": None,
+    }
+
+    assert build_client_item(item) == {
+        "input_ids": [10, 20, 30],
+        "loss_mask": [0, 1, 1],
+    }
+
+
+def test_arrow_dataset_aligns_multimodal_hidden_state_tokens(tmp_path: Path):
+    data_path = tmp_path / "data"
+    dataset = Dataset.from_dict(
+        {
+            "input_ids": [[1, 90, 90, 2, 3, 4]],
+            "loss_mask": [[0, 0, 0, 0, 1, 0]],
+            "seq_len": [6],
+            "messages": [
+                [
+                    {
+                        "role": "user",
+                        "content": [{"type": "audio", "path": "/tmp/a.wav"}],
+                    },
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "path": "answer"}],
+                    },
+                ]
+            ],
+        }
+    )
+    dataset.set_format(
+        type="torch",
+        columns=["input_ids", "loss_mask", "seq_len"],
+        output_all_columns=True,
+    )
+    dataset.save_to_disk(str(data_path))
+    hidden_states_path = data_path / "hidden_states"
+    hidden_states_path.mkdir()
+
+    returned_ids = torch.tensor([1, 90, 90, 90, 90, 2, 3])
+    save_file(
+        {
+            "token_ids": returned_ids,
+            "hidden_states": torch.randn(7, 2, 4),
+        },
+        hidden_states_path / "hs_0.safetensors",
+    )
+
+    arrow_dataset = ArrowDataset(
+        max_len=128,
+        datapath=data_path,
+        on_missing="raise",
+    )
+    sample = arrow_dataset[0]
+
+    assert sample is not None
+    assert sample["input_ids"].tolist() == returned_ids.tolist()
+    assert sample["loss_mask"].tolist() == [0, 0, 0, 0, 0, 0, 1]

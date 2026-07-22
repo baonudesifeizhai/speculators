@@ -11,7 +11,11 @@ from functools import partial
 from typing import Any
 
 import torch
-from torch.nn.functional import binary_cross_entropy_with_logits, softmax
+from torch.nn.functional import (
+    binary_cross_entropy_with_logits,
+    cross_entropy,
+    softmax,
+)
 
 from speculators.models.metrics import (
     LossConfig,
@@ -45,7 +49,7 @@ def _masked_decayed_mean(
     return (weighted.sum(dim=1) / denominator).mean()
 
 
-def compute_metrics(
+def compute_metrics(  # noqa: C901
     logits: torch.Tensor,  # [1, T, draft_vocab_size] (Markov-corrected)
     targets: torch.Tensor,  # [1, T, draft_vocab_size]
     confidence_logits: torch.Tensor | None,  # [1, T] or None
@@ -57,6 +61,10 @@ def compute_metrics(
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = True,
+    modality_ids: torch.Tensor | None = None,  # [1, T] or None
+    modality_names: tuple[str, ...] | None = None,
+    modality_router_logits: torch.Tensor | None = None,  # [num_blocks, num_modalities]
+    modality_router_alpha: float = 0.1,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -84,12 +92,17 @@ def compute_metrics(
         draft_p = softmax(logits.float(), dim=-1)
         target_p = softmax(targets.float(), dim=-1)
         accept_rate = torch.minimum(draft_p, target_p).sum(dim=-1)  # [1, T]
-        # Per-block cumulative acceptance product over the draft slots (slot 0
-        # is the anchor), shared by the accept-length and calibration metrics.
+        # Per-block cumulative acceptance product over the actual draft slots,
+        # shared by the accept-length and calibration metrics. DSpark predicts
+        # from slot 0; DFlash-style training reserves slot 0 for the anchor.
         num_blocks = seq_len // block_size
         accept_blocks = accept_rate.view(num_blocks, block_size)
-        draft_mask = loss_mask.to(accept_rate.dtype).view(num_blocks, block_size)[:, 1:]
-        accept_prefix = (accept_blocks[:, 1:] * draft_mask).cumprod(dim=-1)
+        mask_blocks = loss_mask.to(accept_rate.dtype).view(num_blocks, block_size)
+        draft_start = 0 if sample_from_anchor else 1
+        draft_mask = mask_blocks[:, draft_start:]
+        draft_accept = accept_blocks[:, draft_start:]
+        accept_prefix = (draft_accept * draft_mask).cumprod(dim=-1)
+        block_valid = (draft_mask.sum(dim=-1) > 0).to(accept_rate.dtype)
 
     metrics: dict[str, Any] = {}
     if confidence_logits is not None:
@@ -116,12 +129,70 @@ def compute_metrics(
             # Calibration of the cumulative acceptance product, which is what
             # dynamic draft-length thresholding consumes (signed pred - target).
             conf_prefix = (
-                conf_prob.view(num_blocks, block_size)[:, 1:] * draft_mask
+                conf_prob.view(num_blocks, block_size)[:, draft_start:] * draft_mask
             ).cumprod(dim=-1)
             metrics["confidence_cumprod_bias_sum"] = (
                 (conf_prefix - accept_prefix) * draft_mask
             ).sum()
             metrics["confidence_cumprod_bias_total"] = draft_mask.sum().clamp_min(1.0)
+
+    if modality_router_logits is not None:
+        if modality_ids is None or modality_names is None:
+            raise ValueError(
+                "modality IDs and names are required with modality router logits"
+            )
+        if modality_ids.shape != accept_rate.shape:
+            raise ValueError(
+                "modality_ids must match acceptance-rate shape, got "
+                f"{modality_ids.shape} and {accept_rate.shape}"
+            )
+        modality_ids = modality_ids.to(device=device, dtype=torch.long)
+        if modality_router_logits.shape != (num_blocks, len(modality_names)):
+            raise ValueError(
+                "modality_router_logits must have shape "
+                f"({num_blocks}, {len(modality_names)}), got "
+                f"{tuple(modality_router_logits.shape)}"
+            )
+
+        router_targets = modality_ids.view(num_blocks, block_size)[:, 0].long()
+        # Equalize the total contribution of every modality present in this
+        # packed batch so minority audio/video routes cannot be ignored.
+        valid_targets = router_targets * block_valid.long()
+        counts = torch.bincount(
+            valid_targets,
+            weights=block_valid,
+            minlength=len(modality_names),
+        ).to(modality_router_logits.dtype)
+        present = (counts > 0).to(counts.dtype)
+        class_weights = torch.where(
+            counts > 0,
+            block_valid.sum() / (present.sum().clamp_min(1.0) * counts.clamp_min(1.0)),
+            torch.zeros_like(counts),
+        )
+        router_ce = cross_entropy(
+            modality_router_logits.float(),
+            router_targets,
+            weight=class_weights.float(),
+            reduction="none",
+        )
+        router_loss = (router_ce * block_valid).sum() / block_valid.sum().clamp_min(1.0)
+        loss = loss + modality_router_alpha * router_loss
+
+        with torch.no_grad():
+            router_pred = modality_router_logits.argmax(dim=-1)
+            router_correct = (router_pred == router_targets).to(block_valid.dtype)
+            metrics["modality_router_loss_sum"] = router_loss.detach().clone()
+            metrics["modality_router_loss_total"] = torch.ones((), device=device)
+            metrics["modality_router_acc_sum"] = (router_correct * block_valid).sum()
+            metrics["modality_router_acc_total"] = block_valid.sum()
+            for modality_id, name in enumerate(modality_names):
+                route_mask = block_valid * (router_targets == modality_id).to(
+                    block_valid.dtype
+                )
+                metrics[f"modality_router_acc_{name}_sum"] = (
+                    router_correct * route_mask
+                ).sum()
+                metrics[f"modality_router_acc_{name}_total"] = route_mask.sum()
 
     ones = torch.ones((), device=device)
     metrics["loss_sum"] = loss.detach().clone()
@@ -135,14 +206,65 @@ def compute_metrics(
         mask_f = loss_mask.to(accept_rate.dtype)
         metrics["accept_rate_sum"] = (accept_rate * mask_f).sum()
         metrics["accept_rate_total"] = mask_f.sum().clamp_min(1.0)
+        # Unlike the position-decayed TV training loss, this is the unweighted
+        # per-token TV distance. It therefore obeys raw_tv = 1 - accept_rate.
+        metrics["raw_tv_sum"] = ((1.0 - accept_rate) * mask_f).sum()
+        metrics["raw_tv_total"] = mask_f.sum().clamp_min(1.0)
+
+        for pos in range(draft_start, block_size):
+            pos_mask = mask_blocks[:, pos]
+            metrics[f"accept_rate_position_{pos}_sum"] = (
+                accept_blocks[:, pos] * pos_mask
+            ).sum()
+            metrics[f"accept_rate_position_{pos}_total"] = pos_mask.sum()
 
     # Expected accepted draft length per block (DSpark's tau): the cumulative
     # acceptance product summed over draft slots, plus the always-emitted anchor.
     with torch.no_grad():
         per_block_len = accept_prefix.sum(dim=-1) + 1.0
-        block_valid = (draft_mask.sum(dim=-1) > 0).to(accept_rate.dtype)
         metrics["accept_len_sum"] = (per_block_len * block_valid).sum()
         metrics["accept_len_total"] = block_valid.sum().clamp_min(1.0)
+
+    # Split the same diagnostics by routed input modality. Do not clamp subgroup
+    # totals: after DDP reduction, an absent modality must contribute zero rather
+    # than a fake denominator of one.
+    if modality_ids is not None:
+        if modality_names is None:
+            raise ValueError("modality_names is required when modality_ids is set")
+        if modality_ids.shape != accept_rate.shape:
+            raise ValueError(
+                "modality_ids must match acceptance-rate shape, got "
+                f"{modality_ids.shape} and {accept_rate.shape}"
+            )
+
+        with torch.no_grad():
+            modality_ids = modality_ids.to(device=device, dtype=torch.long)
+            modality_blocks = modality_ids.view(num_blocks, block_size)
+            block_modality_ids = modality_blocks[:, 0]
+            for modality_id, name in enumerate(modality_names):
+                modality_mask = (modality_ids == modality_id).to(mask_f.dtype)
+                token_mask = mask_f * modality_mask
+                metrics[f"accept_rate_{name}_sum"] = (accept_rate * token_mask).sum()
+                metrics[f"accept_rate_{name}_total"] = token_mask.sum()
+                metrics[f"raw_tv_{name}_sum"] = ((1.0 - accept_rate) * token_mask).sum()
+                metrics[f"raw_tv_{name}_total"] = token_mask.sum()
+
+                for pos in range(draft_start, block_size):
+                    pos_mask = mask_blocks[:, pos] * (
+                        modality_blocks[:, pos] == modality_id
+                    ).to(mask_blocks.dtype)
+                    metrics[f"accept_rate_{name}_position_{pos}_sum"] = (
+                        accept_blocks[:, pos] * pos_mask
+                    ).sum()
+                    metrics[f"accept_rate_{name}_position_{pos}_total"] = pos_mask.sum()
+
+                modality_block_mask = block_valid * (
+                    block_modality_ids == modality_id
+                ).to(block_valid.dtype)
+                metrics[f"accept_len_{name}_sum"] = (
+                    per_block_len * modality_block_mask
+                ).sum()
+                metrics[f"accept_len_{name}_total"] = modality_block_mask.sum()
 
     # Per-position greedy accuracy
     # Start position: 0 if sample_from_anchor else 1 (skip anchor)

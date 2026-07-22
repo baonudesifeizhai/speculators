@@ -8,6 +8,8 @@ from datasets import Dataset as HFDataset
 from tqdm import tqdm  # type: ignore[import-untyped]
 from transformers import AutoConfig
 
+from speculators.models.utils import resolve_verifier_text_config
+
 __all__ = [
     "build_vocab_mappings_from_distribution",
     "save_token_frequency_distribution",
@@ -109,10 +111,6 @@ def get_target_vocab_size(target_vocab_size, target_model_path):
     if has_vocab:
         return target_vocab_size
 
-    config = AutoConfig.from_pretrained(target_model_path)
-
-    # For multimodal models (Qwen3VL, etc.), extract text_config
-    if hasattr(config, "text_config"):
-        config = config.text_config
+    config = resolve_verifier_text_config(AutoConfig.from_pretrained(target_model_path))
 
     return config.vocab_size

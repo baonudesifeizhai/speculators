@@ -187,6 +187,77 @@ def test_extract_conversation_no_usable_input_returns_empty():
     assert regen.extract_conversation({"answer": "orphan"}, "question")[0] == []
 
 
+def test_extract_conversation_adapts_local_audio_for_chat(tmp_path):
+    audio_path = tmp_path / "question.wav"
+    audio_path.write_bytes(b"RIFF")
+    row = {
+        "conversations": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "path": str(audio_path)},
+                    {"type": "text", "text": "What did you hear?"},
+                ],
+            },
+            {"role": "assistant", "content": "old answer"},
+        ]
+    }
+
+    turns, _ = regen.extract_conversation(row, None)
+
+    assert turns == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": audio_path.resolve().as_uri()},
+                },
+                {"type": "text", "text": "What did you hear?"},
+            ],
+        }
+    ]
+
+
+def test_extract_conversation_preserves_untyped_structured_content_as_text():
+    # ``datasets`` may decode a JSON-array string in WildChat into a list of
+    # dictionaries.  It is user text, not an OpenAI multimodal content list.
+    structured_content = [
+        {
+            "vehicle_number": "KL 41 7790",
+            "trips": [{"trip": 3, "stations": [{"station": "ALUVA"}]}],
+        }
+    ]
+    row = {
+        "conversations": [
+            {"role": "user", "content": structured_content},
+            {"role": "assistant", "content": "old answer"},
+        ]
+    }
+
+    turns, _ = regen.extract_conversation(row, None)
+
+    assert turns == [
+        {
+            "role": "user",
+            "content": json.dumps(structured_content, ensure_ascii=False),
+        }
+    ]
+
+
+def test_extract_conversation_serializes_numeric_content_as_text():
+    row = {
+        "conversations": [
+            {"role": "user", "content": 1},
+            {"role": "assistant", "content": "old answer"},
+        ]
+    }
+
+    turns, _ = regen.extract_conversation(row, None)
+
+    assert turns == [{"role": "user", "content": "1"}]
+
+
 # ---------------------------------------------------------------------------
 # 2. The generation boundary is the loss mask; pre-tokenized rows pass through.
 # ---------------------------------------------------------------------------
@@ -196,6 +267,45 @@ def test_build_boundary_sample_is_the_mask():
     input_ids, loss_mask = regen.build_boundary_sample([10, 11, 12, 13], [20, 21, 22])
     assert input_ids == [10, 11, 12, 13, 20, 21, 22]
     assert loss_mask == [0, 0, 0, 0, 1, 1, 1]
+
+
+def test_multimodal_boundary_sample_keeps_replay_messages():
+    prefix = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "audio_url",
+                    "audio_url": {"url": "file:///tmp/question.wav"},
+                }
+            ],
+        }
+    ]
+    response = {
+        "choices": [
+            {
+                "message": {"content": "answer"},
+                "token_ids": [20, 21],
+                "finish_reason": "stop",
+            }
+        ],
+        "prompt_token_ids": [10, 11],
+    }
+
+    sample, _, _ = regen._sample_from_response(
+        response,
+        prefix=prefix,
+        conv_id="audio-1",
+        sample_index=0,
+        idx=0,
+        endpoint="ep",
+        sampling_params={},
+    )
+
+    assert json.loads(sample["messages"]) == [
+        *prefix,
+        {"role": "assistant", "content": "answer"},
+    ]
 
 
 def test_pretokenized_rows_pass_through_preprocessing():
@@ -215,6 +325,36 @@ def test_pretokenized_rows_pass_through_preprocessing():
     assert out["input_ids"][0].tolist() == input_ids
     assert out["loss_mask"][0].tolist() == loss_mask
     assert "conversations" not in out
+
+
+def test_pretokenized_multimodal_rows_preserve_replay_messages():
+    messages = [
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": "file:///tmp/question.wav"},
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "answer"},
+        ]
+    ]
+    serialized_messages = json.dumps(messages[0])
+    out = _preprocess_batch(
+        {
+            "input_ids": [[1, 2, 3]],
+            "loss_mask": [[0, 0, 1]],
+            "messages": [serialized_messages],
+        },
+        processor=None,  # type: ignore[arg-type]  # passthrough never touches it
+        max_length=2048,
+        assistant_pattern=None,
+    )
+
+    assert out["messages"] == [serialized_messages]
 
 
 def test_pretokenized_passthrough_truncates_and_filters():
@@ -698,6 +838,21 @@ def test_sample_from_response_rejects_empty_and_missing_token_ids():
     with pytest.raises(ValueError, match="return_token_ids"):
         regen._sample_from_response(
             bad,
+            prefix=[],
+            conv_id="c",
+            sample_index=0,
+            idx=0,
+            endpoint="ep",
+            sampling_params={},
+        )
+
+    # A syntactically valid response cut off by max_tokens is not teacher data.
+    truncated = _response(
+        prompt_token_ids=[1], token_ids=[2], content="unfinished", finish="length"
+    )
+    with pytest.raises(ValueError, match="reached max_tokens"):
+        regen._sample_from_response(
+            truncated,
             prefix=[],
             conv_id="c",
             sample_index=0,

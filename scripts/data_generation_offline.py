@@ -37,7 +37,7 @@ from speculators.data_generation.vllm_client import (
     generate_hidden_states_async,
     wait_for_lock_async,
 )
-from speculators.train.data import build_client_item
+from speculators.train.data import align_multimodal_loss_mask, build_client_item
 from speculators.train.logger import setup_root_logger
 
 logger = logging.getLogger(__name__)
@@ -242,13 +242,26 @@ async def worker(  # noqa: C901
                     shutil.move, hidden_states_path, target_hidden_states_path
                 )
                 if validate_outputs:
+                    item_loss_mask = item.get("loss_mask")
+                    item_is_multimodal = "messages" in item
 
                     def _load_and_check(
                         path=target_hidden_states_path,
                         tokens=item["input_ids"],
+                        loss_mask=item_loss_mask,
+                        is_multimodal=item_is_multimodal,
                     ):
                         loaded = load_file(path)
-                        check_hidden_states(loaded, tokens)
+                        returned_tokens = loaded["token_ids"].tolist()
+                        if returned_tokens != tokens:
+                            if not is_multimodal or loss_mask is None:
+                                check_hidden_states(loaded, tokens)
+                            align_multimodal_loss_mask(
+                                tokens,
+                                loss_mask,
+                                returned_tokens,
+                            )
+                        check_hidden_states(loaded, returned_tokens)
 
                     await asyncio.to_thread(_load_and_check)
         except Exception as e:

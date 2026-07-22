@@ -5,6 +5,7 @@ import random
 import shutil
 import warnings
 from collections.abc import Callable
+from difflib import SequenceMatcher
 from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -124,6 +125,64 @@ def _has_multimodal_content(messages: list[dict]) -> bool:
     return any(isinstance(m.get("content"), list) for m in messages)
 
 
+def align_multimodal_loss_mask(
+    source_token_ids: list[int] | torch.Tensor,
+    source_loss_mask: list[int] | torch.Tensor,
+    target_token_ids: list[int] | torch.Tensor,
+) -> torch.Tensor:
+    """Align a preprocessing loss mask to vLLM's multimodal token expansion.
+
+    Hugging Face processors may use a fixed number of placeholder tokens while
+    vLLM expands audio/image/video placeholders according to the actual encoder
+    feature length.  The returned hidden states follow vLLM's token IDs, so copy
+    masks for exact matching spans and leave server-only placeholders untrained.
+
+    Every source token marked for training must still occur in an exact matching
+    span.  This makes processor differences in user-side multimodal placeholders
+    safe while rejecting any disagreement in assistant text.
+    """
+    source_ids = torch.as_tensor(source_token_ids, dtype=torch.long)
+    source_mask = torch.as_tensor(source_loss_mask)
+    target_ids = torch.as_tensor(target_token_ids, dtype=torch.long)
+
+    if source_ids.ndim != 1 or source_mask.ndim != 1 or target_ids.ndim != 1:
+        raise ValueError("Token IDs and loss mask must be one-dimensional")
+    if source_ids.numel() != source_mask.numel():
+        raise ValueError(
+            "Source token IDs and loss mask must have the same length: "
+            f"{source_ids.numel()} != {source_mask.numel()}"
+        )
+
+    aligned_mask = torch.zeros(target_ids.numel(), dtype=source_mask.dtype)
+    matched_source = torch.zeros(source_ids.numel(), dtype=torch.bool)
+    matcher = SequenceMatcher(
+        None,
+        source_ids.tolist(),
+        target_ids.tolist(),
+        autojunk=False,
+    )
+    for source_start, target_start, size in matcher.get_matching_blocks():
+        if size == 0:
+            continue
+        source_end = source_start + size
+        target_end = target_start + size
+        aligned_mask[target_start:target_end] = source_mask[source_start:source_end]
+        matched_source[source_start:source_end] = True
+
+    missing_training_tokens = torch.nonzero(
+        source_mask.to(torch.bool) & ~matched_source,
+        as_tuple=False,
+    ).flatten()
+    if missing_training_tokens.numel() != 0:
+        first = int(missing_training_tokens[0])
+        raise ValueError(
+            "vLLM tokenization differs inside assistant training tokens; "
+            f"first unmatched source position is {first}"
+        )
+
+    return aligned_mask
+
+
 def build_client_item(dataset_item: dict) -> ClientItem:
     """Build a request payload for vLLM hidden-state extraction.
 
@@ -148,8 +207,20 @@ def build_client_item(dataset_item: dict) -> ClientItem:
     """
     out_dict: dict = {"input_ids": dataset_item["input_ids"].tolist()}
 
-    if "messages" in dataset_item and _has_multimodal_content(dataset_item["messages"]):
-        out_dict["messages"] = dataset_item["messages"]
+    if "loss_mask" in dataset_item:
+        out_dict["loss_mask"] = dataset_item["loss_mask"].tolist()
+
+    messages = dataset_item.get("messages")
+    if messages is not None:
+        if isinstance(messages, str):
+            try:
+                messages = json.loads(messages)
+            except json.JSONDecodeError as error:
+                raise ValueError("messages must contain valid JSON") from error
+        if not isinstance(messages, list):
+            raise ValueError("messages must be a conversation list or JSON string")
+        if _has_multimodal_content(messages):
+            out_dict["messages"] = messages
 
     return cast("ClientItem", out_dict)
 
@@ -328,7 +399,19 @@ class ArrowDataset(BaseDataset):
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states from {hs_filepath}")
 
-            check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+            source_token_ids = dataset_item["input_ids"]
+            target_token_ids = loaded_hs["token_ids"]
+            if torch.equal(source_token_ids, target_token_ids):
+                check_hidden_states(loaded_hs, source_token_ids.tolist())
+            elif "messages" in client_item:
+                align_multimodal_loss_mask(
+                    source_token_ids,
+                    dataset_item["loss_mask"],
+                    target_token_ids,
+                )
+                check_hidden_states(loaded_hs, target_token_ids.tolist())
+            else:
+                check_hidden_states(loaded_hs, source_token_ids.tolist())
 
             match self.on_generate:
                 case "cache":
@@ -378,23 +461,43 @@ class ArrowDataset(BaseDataset):
         #   "token_ids": [seq_len]
         # }
 
-        if not torch.equal(loaded_hs["token_ids"], self.data[index]["input_ids"]):
+        dataset_item = self.data[index]
+        source_token_ids = dataset_item["input_ids"]
+        target_token_ids = loaded_hs["token_ids"]
+        if torch.equal(target_token_ids, source_token_ids):
+            loss_mask = dataset_item["loss_mask"]
+        elif "messages" in build_client_item(dataset_item):
+            try:
+                loss_mask = align_multimodal_loss_mask(
+                    source_token_ids,
+                    dataset_item["loss_mask"],
+                    target_token_ids,
+                )
+            except ValueError as error:
+                warnings.warn(
+                    f"Cannot align multimodal token ids for index {index}: {error}",
+                    stacklevel=1,
+                )
+                return None
+        else:
             warnings.warn(
-                f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
-                f"match input ids {self.data[index]['input_ids']}",
+                f"Loaded token ids {target_token_ids} for index {index} don't "
+                f"match input ids {source_token_ids}",
                 stacklevel=1,
             )
             return None
 
+        seq_len = min(target_token_ids.shape[0], self.max_len)
+
         return {
-            "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
+            "hidden_states": loaded_hs["hidden_states"][:seq_len, :-1].flatten(
                 1
             ),  # [seq_len, 3 * hidden_size]
-            "input_ids": loaded_hs["token_ids"],  # [seq_len]
+            "input_ids": target_token_ids[:seq_len],  # [seq_len]
             "verifier_last_hidden_states": loaded_hs["hidden_states"][
-                :, -1
+                :seq_len, -1
             ],  # [seq_len, hidden_size]
-            "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
+            "loss_mask": loss_mask[:seq_len],  # [seq_len]
         }
 
 

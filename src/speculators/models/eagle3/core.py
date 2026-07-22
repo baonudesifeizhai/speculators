@@ -17,7 +17,11 @@ from speculators.models.eagle3.attention import (
 from speculators.models.eagle3.metrics import compute_metrics
 from speculators.models.eagle3.model_definitions import model_classes
 from speculators.models.metrics import LossConfig, resolve_loss_config
-from speculators.models.utils import conditional_torch_compile, resolve_target_layer_ids
+from speculators.models.utils import (
+    conditional_torch_compile,
+    resolve_target_layer_ids,
+    resolve_verifier_text_config,
+)
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
 
@@ -172,11 +176,9 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         self.embed_tokens.weight.requires_grad_(self.config.embed_requires_grad)
 
         verifier_config = self.config.speculators_config.verifier
-        verifier_model_config = AutoConfig.from_pretrained(verifier_config.name_or_path)  # type: ignore[arg-type]
-
-        # For multimodal models (Qwen3VL, etc.), extract text_config
-        if hasattr(verifier_model_config, "text_config"):
-            verifier_model_config = verifier_model_config.text_config
+        verifier_model_config = resolve_verifier_text_config(
+            AutoConfig.from_pretrained(verifier_config.name_or_path)  # type: ignore[arg-type]
+        )
 
         if verifier_model_config.hidden_size != self.hidden_size:
             raise ValueError(

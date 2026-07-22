@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -65,6 +66,14 @@ def parse_args():
         type=_dataset_choice,
         choices=REGEN_DATASETS,
         help="Dataset to process",
+    )
+    parser.add_argument(
+        "--input-jsonl",
+        default=None,
+        help=(
+            "Local JSON/JSONL file in conversations format. When provided, "
+            "it replaces the Hugging Face dataset selected by --dataset."
+        ),
     )
     parser.add_argument(
         "--split",
@@ -173,6 +182,75 @@ def _message_role_content(m: dict) -> tuple[str | None, Any]:
     return None, content
 
 
+def _adapt_scalar_content_for_chat(content: Any) -> Any:
+    if content is None or isinstance(content, str):
+        return content
+    # WildChat also contains numeric and object-valued message content. Chat
+    # Completions accepts a string or typed content parts, so retain these
+    # values losslessly as JSON text instead of sending invalid JSON.
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _adapt_content_part_for_chat(part: Any) -> Any:
+    if not isinstance(part, dict):
+        return part
+
+    part_type = part.get("type")
+    if part_type == "text" or (
+        isinstance(part_type, str) and part_type.endswith("_url")
+    ):
+        return part
+
+    if part_type not in ("audio", "image", "video"):
+        raise ValueError(f"Unsupported chat content part: {part}")
+
+    url = part.get("url")
+    if local_path := part.get("path"):
+        resolved = Path(local_path).expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(
+                f"Local {part_type} input does not exist: {resolved}"
+            )
+        url = resolved.as_uri()
+    if not url:
+        raise ValueError(f"{part_type} content requires a local path or URL")
+
+    url_key = f"{part_type}_url"
+    return {"type": url_key, url_key: {"url": str(url)}}
+
+
+def _adapt_content_for_chat(content: Any) -> Any:
+    """Convert local multimodal parts to OpenAI chat-completion content."""
+    if not isinstance(content, list):
+        return _adapt_scalar_content_for_chat(content)
+
+    # The datasets JSON loader may decode a string containing a JSON array into
+    # a real list.  WildChat contains examples like this (structured API output
+    # pasted by the user), but an OpenAI chat ``content`` list only accepts typed
+    # text/image/audio/video parts.  Preserve the structured value as text rather
+    # than treating its dictionaries as malformed multimodal parts.
+    if any(
+        isinstance(part, dict) and not _is_present(part.get("type")) for part in content
+    ):
+        return json.dumps(content, ensure_ascii=False)
+
+    return [_adapt_content_part_for_chat(part) for part in content]
+
+
+def _has_multimodal_messages(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(message.get("content"), list)
+        and any(
+            isinstance(part, dict) and part.get("type") != "text"
+            for part in message["content"]
+        )
+        for message in messages
+    )
+
+
 def extract_conversation(
     row: dict[str, Any], prompt_field: str | None
 ) -> tuple[list[dict[str, Any]], list[tuple[Any, list[str]]]]:
@@ -194,7 +272,7 @@ def extract_conversation(
             continue
         role, content = _message_role_content(m)
         if role in ("system", "user") and content:
-            turns.append({"role": role, "content": content})
+            turns.append({"role": role, "content": _adapt_content_for_chat(content)})
         elif role == "tool" and content is not None:
             results.append((content, _tool_result_names(content)))
         # original assistant/gpt turns are dropped and regenerated
@@ -366,6 +444,41 @@ async def detect_model(endpoint: str) -> str:
         ) from e
 
 
+def load_regeneration_dataset(args):
+    """Resolve either a local JSONL file or a configured HF streaming dataset."""
+    if args.input_jsonl:
+        input_path = Path(args.input_jsonl).expanduser().resolve()
+        if not input_path.is_file():
+            raise FileNotFoundError(f"Input JSONL does not exist: {input_path}")
+        dataset_config = DatasetConfig(
+            name="local-jsonl",
+            hf_path="json",
+            split="train",
+        )
+        dataset_id = str(input_path)
+        split = "train"
+        subset = None
+        dataset = load_dataset(
+            "json",
+            data_files=dataset_id,
+            split=split,
+            streaming=True,
+        )
+    else:
+        dataset_config = DATASET_CONFIGS[args.dataset]
+        dataset_id = dataset_config.hf_path
+        split = args.split if args.split is not None else dataset_config.split
+        subset = args.subset if args.subset is not None else dataset_config.subset
+        dataset = load_dataset(
+            dataset_id,
+            name=subset,
+            split=split,
+            streaming=True,
+        )
+
+    return dataset_config, dataset_id, split, subset, dataset
+
+
 # Transient statuses worth retrying: request timeout, conflict, too-early, and
 # rate limiting, plus all 5xx. Other non-2xx replies (e.g. 400/401/404) are
 # permanent config/client errors and fail fast.
@@ -448,6 +561,10 @@ def _sample_from_response(
     empty generation or a response missing the ``return_token_ids`` payload.
     """
     choice = data["choices"][0]
+    if choice.get("finish_reason") == "length":
+        raise ValueError(
+            f"assistant generation reached max_tokens (sample {sample_index})"
+        )
     message = choice["message"]
     content = message.get("content")
     tool_calls = message.get("tool_calls")
@@ -476,6 +593,7 @@ def _sample_from_response(
     else:
         assistant_msg = {"role": "assistant", "content": content}
 
+    conversation = [*prefix, assistant_msg]
     sample = {
         "id": f"{conv_id}_gen{sample_index}",
         # Conversation-level key for --resume; the row `id` is generation-suffixed
@@ -484,7 +602,7 @@ def _sample_from_response(
         "input_ids": input_ids,
         "loss_mask": loss_mask,
         # Review-only twin of input_ids; ignored by training.
-        "conversations": [*prefix, assistant_msg],
+        "conversations": conversation,
         "metadata": {
             "idx": idx,
             "finish_reason": choice.get("finish_reason"),
@@ -494,6 +612,13 @@ def _sample_from_response(
             "sampling_params": sampling_params,
         },
     }
+    if _has_multimodal_messages(conversation):
+        # Hidden-state extraction must replay the real audio/image/video input;
+        # token IDs alone only carry placeholders and cannot reconstruct encoder
+        # embeddings. Store the whole conversation as JSON because Arrow cannot
+        # represent a union of multimodal list content and assistant string
+        # content without coercing the lists to strings.
+        sample["messages"] = json.dumps(conversation, ensure_ascii=False)
     return sample, assistant_msg, tool_calls
 
 
@@ -689,13 +814,9 @@ async def main():
 
     print(f"Using model: {args.model}")
 
-    # Get dataset configuration
-    dataset_config = DATASET_CONFIGS[args.dataset]
-    dataset_id = dataset_config.hf_path
-
-    # Use dataset-specific defaults if not provided
-    split = args.split if args.split is not None else dataset_config.split
-    subset = args.subset if args.subset is not None else dataset_config.subset
+    dataset_config, dataset_id, split, _subset, dataset = load_regeneration_dataset(
+        args
+    )
 
     # Generate output filename if not specified
     if args.outfile is None:
@@ -716,8 +837,6 @@ async def main():
     print()
 
     seen_ids = load_seen(args.outfile) if args.resume else set()
-    dataset = load_dataset(dataset_id, name=subset, split=split, streaming=True)
-
     queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
 
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=90, sock_read=None)
@@ -767,21 +886,22 @@ async def main():
                 if args.language_filter and row.get("language") != args.language_filter:
                     continue
 
-                prepared = prepare_row(row, dataset_config)
-                if prepared is None:
-                    continue
-                normalized, turns, tool_results = prepared
-
                 primary_id = _primary_identifier(row)
                 if primary_id in seen_ids:
                     continue
 
-                # Broken input tool schema: record and skip (don't crash the run).
                 try:
+                    prepared = prepare_row(row, dataset_config)
+                    if prepared is None:
+                        continue
+                    normalized, turns, tool_results = prepared
                     tools = extract_tools(normalized)
-                except ValueError as exc:
+                except Exception as exc:  # noqa: BLE001
+                    # Input failures are isolated to one row.  A malformed chat
+                    # part, tool schema, or missing local media file must not
+                    # terminate a multi-hour regeneration run.
                     logger.warning(
-                        "Skipping row %s: input tool schema is broken (%s)",
+                        "Skipping row %s: input preparation failed (%s)",
                         primary_id,
                         exc,
                     )
@@ -799,6 +919,12 @@ async def main():
                     )
                     error_file.flush()
                     stats["errors"] += 1
+                    progress.set_postfix(
+                        ok=stats["ok"],
+                        errors=stats["errors"],
+                        truncated=stats["truncated"],
+                        refresh=False,
+                    )
                     progress.update(1)
                     continue
 

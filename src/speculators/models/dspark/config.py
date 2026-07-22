@@ -65,3 +65,22 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "hidden state as the confidence-head input."
         ),
     )
+
+    # Optional modality-specific text-token heads. The shared DSpark backbone still
+    # consumes Thinker's fused hidden states; these heads specialize the final draft
+    # distribution for text-, image-, audio-, and video-conditioned requests.
+    modality_head_rank: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Rank of each modality-specific residual logit head. Set to 0 to "
+            "disable modality routing and retain vanilla DSpark behavior."
+        ),
+    )
+    modality_token_ids: dict[str, list[int]] = Field(
+        default_factory=dict,
+        description=(
+            "Verifier special-token IDs used to route image, audio, and video "
+            "documents. Text is the fallback when no multimodal token is present."
+        ),
+    )

@@ -130,6 +130,11 @@ class DraftVocabMixin(nn.Module):
         """
         import warnings  # noqa: PLC0415
 
+        from transformers import AutoConfig  # noqa: PLC0415
+
+        from speculators.models.utils import (  # noqa: PLC0415
+            resolve_verifier_weight_prefix,
+        )
         from speculators.utils.loading import load_model_layers  # noqa: PLC0415
 
         speculators_config = getattr(
@@ -141,6 +146,9 @@ class DraftVocabMixin(nn.Module):
         if verifier_config.name_or_path is None:
             return
 
+        verifier_hf_config = AutoConfig.from_pretrained(verifier_config.name_or_path)
+        preferred_prefix = resolve_verifier_weight_prefix(verifier_hf_config)
+
         # Determine which weights to load based on model attributes
         weights_to_load = ["embed_tokens.weight", "lm_head.weight"]
         if hasattr(self, "verifier_norm"):
@@ -149,6 +157,7 @@ class DraftVocabMixin(nn.Module):
         verifier_weights = load_model_layers(
             weights_to_load,
             verifier_config.name_or_path,
+            preferred_prefix=preferred_prefix,
         )
 
         embed_tokens_weight = verifier_weights["embed_tokens.weight"]

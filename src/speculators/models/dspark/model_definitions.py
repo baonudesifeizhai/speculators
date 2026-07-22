@@ -1,12 +1,19 @@
-"""Sequential (Markov) and confidence heads for the DSpark draft model."""
+"""Sequential, confidence, and modality heads for the DSpark draft model."""
 
 import torch
 from torch import nn
 
 __all__ = [
+    "MODALITY_NAMES",
     "ConfidenceHead",
     "MarkovHead",
+    "ModalityLogitHead",
+    "ModalityRouter",
+    "infer_anchor_modalities",
 ]
+
+
+MODALITY_NAMES = ("text", "image", "audio", "video")
 
 
 class MarkovHead(nn.Module):
@@ -89,3 +96,103 @@ class ConfidenceHead(nn.Module):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.proj(features).squeeze(-1)
+
+
+class ModalityLogitHead(nn.Module):
+    """Low-rank, modality-specific residual over the shared draft logits.
+
+    DSpark's main LM head is copied from the verifier and deliberately frozen.
+    Cloning that full vocabulary projection once per modality would therefore be
+    both wasteful and ineffective.  This head instead learns a compact residual
+    from the shared draft hidden state into the draft vocabulary.
+
+    The output projection starts at zero, so enabling modality heads preserves
+    the vanilla DSpark logits at initialization.
+    """
+
+    def __init__(self, hidden_size: int, draft_vocab_size: int, rank: int) -> None:
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f"modality head rank must be > 0, got {rank}")
+        self.down_proj = nn.Linear(hidden_size, rank, bias=False)
+        self.act = nn.SiLU()
+        self.up_proj = nn.Linear(rank, draft_vocab_size, bias=False)
+        nn.init.zeros_(self.up_proj.weight)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.up_proj(self.act(self.down_proj(hidden_states)))
+
+
+class ModalityRouter(nn.Module):
+    """Predict the request modality from the first draft slot of each block.
+
+    Training uses labels recovered from cached Qwen multimodal special tokens.
+    Serving no longer has those prompt tokens at every decode step, so this
+    lightweight router lets the checkpoint select the same head from its fused
+    Thinker-conditioned hidden state.
+    """
+
+    def __init__(self, hidden_size: int, num_modalities: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, num_modalities, bias=True)
+
+    def forward(self, block_hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.proj(block_hidden_states[:, 0])
+
+
+@torch.compiler.disable
+def infer_anchor_modalities(
+    input_ids: torch.Tensor,
+    document_ids: torch.Tensor,
+    anchor_positions: torch.Tensor,
+    modality_token_ids: dict[str, list[int]],
+) -> torch.Tensor:
+    """Infer each anchor's input modality from special tokens in its document.
+
+    The cached Qwen3-Omni token IDs retain ``image_pad``, ``audio_pad``, and
+    ``video_pad`` tokens even though those tokens are excluded from the draft
+    vocabulary and loss mask.  Routing from the cached IDs avoids rewriting the
+    existing multi-terabyte hidden-state cache with explicit modality labels.
+
+    Documents containing more than one modality use the highest-priority route
+    ``video > audio > image > text``.  The current Thinker dataset has one primary
+    modality per row, but the deterministic precedence keeps mixed requests safe.
+    """
+    input_ids = input_ids.reshape(-1).long()
+    document_ids = document_ids.reshape(-1).long()
+    anchor_positions = anchor_positions.reshape(-1).long()
+    if input_ids.shape != document_ids.shape:
+        raise ValueError(
+            "input_ids and document_ids must have the same flattened shape"
+        )
+
+    token_modalities = torch.zeros_like(input_ids)
+    for modality_id, name in enumerate(MODALITY_NAMES[1:], start=1):
+        matches = torch.zeros_like(input_ids, dtype=torch.bool)
+        for token_id in modality_token_ids.get(name, []):
+            matches |= input_ids == int(token_id)
+        token_modalities = torch.where(
+            matches,
+            torch.full_like(token_modalities, modality_id),
+            token_modalities,
+        )
+
+    # document_ids are dense non-negative indices produced by the collator.
+    # Allocate by sequence length so this remains static-shaped under packing.
+    document_modalities = torch.zeros(
+        input_ids.numel(), dtype=torch.long, device=input_ids.device
+    )
+    valid = document_ids >= 0
+    if torch.any(valid):
+        document_modalities.scatter_reduce_(
+            0,
+            document_ids[valid],
+            token_modalities[valid],
+            reduce="amax",
+            include_self=True,
+        )
+
+    anchor_documents = document_ids[anchor_positions]
+    safe_documents = anchor_documents.clamp_min(0)
+    modalities = document_modalities[safe_documents]
+    return torch.where(anchor_documents >= 0, modalities, torch.zeros_like(modalities))

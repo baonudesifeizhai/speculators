@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
@@ -81,6 +82,7 @@ def create_train_val_loaders(
     num_workers: int,
     prefetch_factor: int,
     preprocess: Callable[[BatchType], BatchType] | None,
+    validation_data_path: str | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -113,28 +115,40 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
         )
     else:
+        explicit_validation = validation_data_path is not None
+        train_split_ratio = 1.0 if explicit_validation else train_data_ratio
+        val_datapath = validation_data_path or data_path
+        val_split_ratio = 1.0 if explicit_validation else train_data_ratio - 1.0
+
+        train_hidden_states_path = hidden_states_path
+        val_hidden_states_path = hidden_states_path
+        if explicit_validation and hidden_states_path is not None:
+            hidden_states_root = Path(hidden_states_path)
+            train_hidden_states_path = hidden_states_root / "train"
+            val_hidden_states_path = hidden_states_root / "validation"
+
         train_dataset = ArrowDataset(
             datapath=data_path,
             max_len=total_seq_len,
-            hidden_states_path=hidden_states_path,
+            hidden_states_path=train_hidden_states_path,
             vllm_endpoint=vllm_endpoint,
             on_missing=on_missing,
             on_generate=on_generate,
             transform=noise_transform,
-            split_ratio=train_data_ratio,
+            split_ratio=train_split_ratio,
             model=verifier_name_or_path,
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
         )
         val_dataset = ArrowDataset(
-            datapath=data_path,
+            datapath=val_datapath,
             max_len=total_seq_len,
-            hidden_states_path=hidden_states_path,
+            hidden_states_path=val_hidden_states_path,
             vllm_endpoint=vllm_endpoint,
             on_missing=on_missing,
             on_generate=on_generate,
-            split_ratio=train_data_ratio - 1.0,
+            split_ratio=val_split_ratio,
             model=verifier_name_or_path,
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,

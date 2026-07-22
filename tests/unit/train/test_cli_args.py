@@ -126,6 +126,18 @@ def test_dspark_confidence_head_alpha(monkeypatch):
     assert val_kw["confidence_head_alpha"] == 0.5
 
 
+def test_dspark_modality_head_rank(monkeypatch):
+    args = _parse(monkeypatch, ["--modality-head-rank", "128"])
+    assert args.modality_head_rank == 128
+
+
+def test_dspark_modality_router_alpha(monkeypatch):
+    args = _parse(monkeypatch, ["--modality-router-alpha", "0.25"])
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["modality_router_alpha"] == 0.25
+    assert val_kw["modality_router_alpha"] == 0.25
+
+
 # ---------------------------------------------------------------------------
 # Per-speculator-type defaults for draft_arch, norm_before_fc, norm_output
 # ---------------------------------------------------------------------------

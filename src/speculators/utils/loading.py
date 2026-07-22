@@ -15,14 +15,24 @@ _WEIGHT_ALIASES: dict[str, list[str]] = {
 }
 
 
-def _resolve_key(name: str, weight_map: dict[str, str]) -> str | None:
+def _resolve_key(
+    name: str,
+    weight_map: dict[str, str],
+    preferred_prefix: str | None = None,
+) -> str | None:
     """Try exact match, then suffix match, then known aliases."""
     for candidate in [name, *_WEIGHT_ALIASES.get(name, [])]:
         if candidate in weight_map:
             return candidate
-        matched = next((k for k in weight_map if k.endswith(candidate)), None)
-        if matched:
-            return matched
+        matches = [key for key in weight_map if key.endswith(candidate)]
+        if preferred_prefix is not None:
+            preferred_matches = [
+                key for key in matches if key.startswith(preferred_prefix)
+            ]
+            if preferred_matches:
+                return preferred_matches[0]
+        if matches:
+            return matches[0]
     return None
 
 
@@ -80,7 +90,10 @@ def list_checkpoint_keys(checkpoint_dir: str | Path) -> list[str]:
 
 
 def load_model_layers(
-    layer_names: list[str], model_path: str
+    layer_names: list[str],
+    model_path: str,
+    *,
+    preferred_prefix: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """
     Load one or more named tensors from a HF repo using safetensors shards.
@@ -90,6 +103,8 @@ def load_model_layers(
     ["model.embed_tokens.weight", "lm_head.weight"]
     :param model_path: either a local directory of huggingface model
     containing model.safetensors.index
+    :param preferred_prefix: checkpoint stage prefix to prefer when suffix
+        matching is ambiguous (for example, ``"thinker."`` for Qwen3-Omni)
     :return: dict mapping input names/patterns to loaded tensors
     """
     # download the index file or build weight map for single-file models
@@ -111,7 +126,7 @@ def load_model_layers(
     # Resolve names: try exact match, then suffix match, then known aliases
     name_to_key = {}  # Maps input name to actual checkpoint key
     for name in layer_names:
-        key = _resolve_key(name, weight_map)
+        key = _resolve_key(name, weight_map, preferred_prefix)
         if key:
             name_to_key[name] = key
         else:

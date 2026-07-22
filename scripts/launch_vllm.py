@@ -3,6 +3,10 @@ import json
 import os
 import sys
 import warnings
+from importlib.util import find_spec
+from pathlib import Path
+
+_QWEN3_OMNI_THINKER_DEPLOY = "qwen3_omni_moe_thinker_only.yaml"
 
 
 def parse_args():
@@ -46,7 +50,44 @@ def parse_args():
         action="store_true",
         help="Print the command that would be executed without running it",
     )
+    parser.add_argument(
+        "--omni",
+        action="store_true",
+        help=(
+            "Launch the vLLM-Omni Thinker-only server and apply extraction "
+            "settings to stage 0."
+        ),
+    )
+    parser.add_argument(
+        "--omni-deploy-config",
+        type=Path,
+        default=None,
+        help=(
+            "Thinker-only vLLM-Omni deploy YAML. By default it is resolved "
+            "from the installed vllm_omni package."
+        ),
+    )
     return parser.parse_known_args()
+
+
+def resolve_omni_deploy_config(config_path: Path | None) -> Path:
+    if config_path is not None:
+        resolved = config_path.expanduser().resolve()
+    else:
+        spec = find_spec("vllm_omni")
+        package_dirs = spec.submodule_search_locations if spec is not None else None
+        if not package_dirs:
+            raise RuntimeError(
+                "Cannot find vllm_omni. Run this script with the vLLM-Omni "
+                "environment or pass --omni-deploy-config."
+            )
+        resolved = (
+            Path(next(iter(package_dirs))) / "deploy" / _QWEN3_OMNI_THINKER_DEPLOY
+        )
+
+    if not resolved.is_file():
+        raise FileNotFoundError(f"vLLM-Omni deploy config not found: {resolved}")
+    return resolved
 
 
 def main():
@@ -56,9 +97,11 @@ def main():
 
     from transformers import AutoConfig  # noqa: PLC0415
 
-    config = AutoConfig.from_pretrained(args.model)
-    if hasattr(config, "text_config"):
-        config = config.text_config
+    from speculators.models.utils import (  # noqa: PLC0415
+        resolve_verifier_text_config,
+    )
+
+    config = resolve_verifier_text_config(AutoConfig.from_pretrained(args.model))
     num_hidden_layers = config.num_hidden_layers
 
     if args.target_layer_ids:
@@ -91,22 +134,44 @@ def main():
         "kv_connector_extra_config": {"shared_storage_path": args.hidden_states_path},
     }
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "vllm.entrypoints.cli.main",
-        "serve",
-        args.model,
-        "--speculative_config",
-        json.dumps(speculative_config),
-        "--kv_transfer_config",
-        json.dumps(kv_transfer_config),
-        *vllm_args,
-    ]
+    if args.omni:
+        deploy_config = resolve_omni_deploy_config(args.omni_deploy_config)
+        stage_overrides = {
+            "0": {
+                "speculative_config": speculative_config,
+                "kv_transfer_config": kv_transfer_config,
+            }
+        }
+        cmd = [
+            sys.executable,
+            "-m",
+            "vllm_omni.entrypoints.cli.main",
+            "serve",
+            args.model,
+            "--omni",
+            "--deploy-config",
+            str(deploy_config),
+            "--stage-overrides",
+            json.dumps(stage_overrides),
+            *vllm_args,
+        ]
+    else:
+        cmd = [
+            sys.executable,
+            "-m",
+            "vllm.entrypoints.cli.main",
+            "serve",
+            args.model,
+            "--speculative_config",
+            json.dumps(speculative_config),
+            "--kv_transfer_config",
+            json.dumps(kv_transfer_config),
+            *vllm_args,
+        ]
 
-    disable_cp_arg = "--no-enable-chunked-prefill"
-    if disable_cp_arg not in cmd:
-        cmd.append(disable_cp_arg)
+        disable_cp_arg = "--no-enable-chunked-prefill"
+        if disable_cp_arg not in cmd:
+            cmd.append(disable_cp_arg)
 
     print("Running command:")
     print(" ".join(cmd))

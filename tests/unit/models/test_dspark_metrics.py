@@ -29,6 +29,7 @@ class TestComputeMetrics:
             2,
             gamma=4.0,
             loss_config=_DEFAULT_LOSS,
+            sample_from_anchor=False,
         )
         assert torch.isfinite(loss)
         # Matching distributions -> CE/TV ~ 0 and acceptance ~ 1.
@@ -55,6 +56,7 @@ class TestComputeMetrics:
             block_size=2,
             gamma=4.0,
             loss_config=_DEFAULT_LOSS,
+            sample_from_anchor=False,
         )
         abs_err = (
             metrics["confidence_abs_error_sum"] / metrics["confidence_abs_error_total"]
@@ -104,12 +106,111 @@ class TestComputeMetrics:
             loss_mask,
             block_size=2,
             loss_config=_DEFAULT_LOSS,
+            sample_from_anchor=False,
         )
         bias = (
             metrics["confidence_cumprod_bias_sum"]
             / metrics["confidence_cumprod_bias_total"]
         )
         assert float(bias) > 0.5
+
+    def test_sample_from_anchor_counts_position_zero(self):
+        # DSpark's slot 0 is a real speculative prediction. With two perfect
+        # draft slots, the expected emitted length is 2 accepted + 1 verifier
+        # fallback/bonus token.
+        ids = torch.tensor([[1, 2]])
+        logits = _ids_to_logits(ids, 8)
+        targets = logits.clone()
+        loss_mask = torch.ones((1, 2), dtype=torch.float32)
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            sample_from_anchor=True,
+        )
+        accept_len = metrics["accept_len_sum"] / metrics["accept_len_total"]
+        assert abs(float(accept_len) - 3.0) < 1e-2
+
+    def test_raw_tv_is_exact_acceptance_complement(self):
+        logits = torch.tensor([[[2.0, 0.0], [0.0, 2.0]]])
+        targets = torch.tensor([[[0.0, 2.0], [0.0, 2.0]]])
+        loss_mask = torch.ones((1, 2), dtype=torch.float32)
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+        )
+        accept = metrics["accept_rate_sum"] / metrics["accept_rate_total"]
+        raw_tv = metrics["raw_tv_sum"] / metrics["raw_tv_total"]
+        assert torch.allclose(accept + raw_tv, torch.tensor(1.0), atol=1e-6)
+
+    def test_modality_metrics_are_separate(self):
+        # First block (text) is perfect; second block (image) is fully wrong.
+        draft_ids = torch.tensor([[0, 1, 2, 3]])
+        target_ids = torch.tensor([[0, 1, 4, 5]])
+        logits = _ids_to_logits(draft_ids, 8)
+        targets = _ids_to_logits(target_ids, 8)
+        loss_mask = torch.ones((1, 4), dtype=torch.float32)
+        modality_ids = torch.tensor([[0, 0, 1, 1]])
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            modality_ids=modality_ids,
+            modality_names=("text", "image", "audio", "video"),
+        )
+        text_accept = (
+            metrics["accept_rate_text_sum"] / metrics["accept_rate_text_total"]
+        )
+        image_accept = (
+            metrics["accept_rate_image_sum"] / metrics["accept_rate_image_total"]
+        )
+        assert float(text_accept) > 0.99
+        assert float(image_accept) < 0.01
+        assert float(metrics["accept_rate_audio_total"]) == 0.0
+        assert "accept_rate_video_position_0_sum" in metrics
+
+    def test_modality_router_loss_and_per_modality_accuracy(self):
+        ids = torch.tensor([[0, 1, 2, 3]])
+        logits = _ids_to_logits(ids, 8)
+        loss_mask = torch.ones((1, 4), dtype=torch.float32)
+        modality_ids = torch.tensor([[0, 0, 1, 1]])
+        router_logits = torch.tensor([[10.0, 0.0], [0.0, 10.0]])
+        base_loss, _ = compute_metrics(
+            logits,
+            logits,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            modality_ids=modality_ids,
+            modality_names=("text", "image"),
+        )
+        routed_loss, metrics = compute_metrics(
+            logits,
+            logits,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            modality_ids=modality_ids,
+            modality_names=("text", "image"),
+            modality_router_logits=router_logits,
+            modality_router_alpha=0.1,
+        )
+        assert float(routed_loss - base_loss) < 1e-3
+        acc = metrics["modality_router_acc_sum"] / metrics["modality_router_acc_total"]
+        assert float(acc) == 1.0
+        assert float(metrics["modality_router_acc_text_total"]) == 1.0
 
     def test_alpha_weighting(self):
         ids = torch.tensor([[0, 1, 0, 2]])
@@ -157,6 +258,8 @@ class TestComputeMetrics:
             "position_1_acc_sum",
             "accept_len_sum",
             "accept_len_total",
+            "raw_tv_sum",
+            "accept_rate_position_0_sum",
             "confidence_cumprod_bias_sum",
         ):
             assert key in metrics
